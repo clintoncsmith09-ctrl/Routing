@@ -22,6 +22,25 @@ from .usage import (
     AccountLedger,
     UsageLedger,
 )
+# ---- Durable Master Orchestrator layer (REAL Temporal) ----
+from .workflow import (  # noqa: E402
+    TaskInput,
+    TaskWorkflow,
+    TASK_QUEUE,
+    create_worker,
+)
+from .store import (  # noqa: E402
+    Reservation,
+    SqliteAtomicStore,
+)
+from .api import (  # noqa: E402
+    AccountRequired,
+    OrchestratorAPI,
+    RateLimitExceeded as APIRateLimitExceeded,
+    TaskNotFound,
+    TenantIsolationViolation,
+)
+from .costing import project_cost  # noqa: E402
 
 __all__ = [
     "orchestrate",
@@ -35,4 +54,17 @@ __all__ = [
     "DecisionLogger",
     "JsonFormatter",
     "LOGGER",
+    # Durable layer
+    "TaskInput",
+    "TaskWorkflow",
+    "TASK_QUEUE",
+    "create_worker",
+    "Reservation",
+    "SqliteAtomicStore",
+    "OrchestratorAPI",
+    "AccountRequired",
+    "TaskNotFound",
+    "TenantIsolationViolation",
+    "APIRateLimitExceeded",
+    "project_cost",
 ]

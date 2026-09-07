@@ -9,9 +9,12 @@ description = "Routes tasks to capability tiers by complexity and cost."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
+dependencies = [
+    "temporalio>=1.32.0",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]
-include = ["routing_matrix*"]
+include = ["routing_matrix*", "orchestrator*"]

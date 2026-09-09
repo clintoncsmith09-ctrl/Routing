@@ -1,8 +1,11 @@
 # Master Orchestrator — Production Deployment Runbook
 
-Grounded in the committed source at commit `4ddd662` (`main`). Every claim
-below cites the file and line it comes from. If code and this doc ever
-disagree, the code wins — update this doc.
+Grounded in the committed source at commit `4ddd662` (`main`; this doc itself
+was added in `c7eb685`). Every claim below cites the file and line it comes
+from — note those line references are a **snapshot as of that commit**: they
+will drift as the code changes, so re-verify against the actual file before
+relying on any specific line number. If code and this doc ever disagree, the
+code wins — update this doc.
 
 Target: run the **Master Orchestrator** (the durable Temporal layer) in
 production: a real Temporal server, one or more long-running Python Worker

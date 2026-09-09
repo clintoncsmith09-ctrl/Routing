@@ -11,9 +11,9 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     # Tested against temporalio 1.32.0 (full suite green at that version).
-    # Floor pinned because SDK method signatures have changed across minors
-    # (e.g. Client.start_workflow's positional-args handling). No hard upper
-    # pin — but before upgrading the SDK past 1.32.0, re-run the whole suite.
+    # No hard upper pin — but this SDK's call signatures are strict (e.g.
+    # Client.start_workflow's positional-args handling), so re-verify call
+    # sites carefully on any version bump, then re-run the whole suite.
     "temporalio>=1.32.0",
 ]
 

@@ -140,12 +140,12 @@ def test_from_env_wiring(monkeypatch):
 def test_concurrent_reserves_serialize_on_one_account():
     """N threads x own connections, barrier-synced, racing reserve() on 1 acct.
 
-    Threshold 0.0011, unit cost 0.0005, N=4: cumulative balances are
-    0.0005/0.0010/0.0015/0.0020, so exactly the last two cross the threshold
+    Threshold 0.0011, unit cost 0.0004, N=4: cumulative balances are
+    0.0004/0.0008/0.0012/0.0016, so exactly the last two cross the threshold
     only if every reservation observes all previous charges. Asserts:
       * exactly 2 of 4 report degraded=True (atomic threshold outcome);
       * final balance == exact sum (no lost updates);
-      * the 4 returned balances are exactly {0.0005..0.0020} — each reserve
+      * the 4 returned balances are exactly {0.0004..0.0016} — each reserve
         saw a distinct serialized position (full serialization, impossible
         under a lost-update race where two txns read the same balance).
     """

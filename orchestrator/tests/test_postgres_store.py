@@ -16,10 +16,20 @@ proofs that matter:
    UPDATE`` on the account lock row; tx2's ``reserve()`` must block until
    tx1 commits (ordering proven with timestamps).
 
+3. ``test_bounded_pool_reuse_max_connections`` — the production gap: the
+   store's ``ConnectionPool`` (``max_connections=2``) must serve many
+   sequential reservations from exactly 2 connections (pool stats
+   ``connections_num``/``pool_size`` + a live ``pg_stat_activity`` count),
+   never opening a fresh connection per call.
+
 Runs against the DSN in ``TEST_POSTGRES_DSN`` (default
 ``postgresql://postgres:postgres@localhost:5432/postgres``). Skips cleanly
 when Postgres (or ``psycopg``) is unavailable, so environments without a
 database still run the rest of the suite green.
+
+Pool hygiene: every store instance constructed in this module is closed in
+teardown (fixture) or at the end of the test, so no connection pool leaks
+across the suite.
 """
 
 from __future__ import annotations
@@ -59,6 +69,7 @@ def store():
     s.reset()
     yield s
     s.reset()
+    s.close()  # pool hygiene: never leak pooled connections across tests
 
 
 # --------------------------------------------------------------------------- #
@@ -120,15 +131,19 @@ def test_from_env_wiring(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", DSN)
     monkeypatch.setenv("STORE_DEGRADED_THRESHOLD", "0.005")
     monkeypatch.setenv("STORE_USAGE_WINDOW_SECONDS", "60")
+    monkeypatch.setenv("STORE_PG_MAX_CONNECTIONS", "3")
     s = PostgresAtomicStore.from_env()
     assert s._threshold == pytest.approx(0.005)
     assert s._window == pytest.approx(60.0)
+    assert s._max_connections == 3
+    assert s._pool.max_size == 3
     s.reset()
     r = s.reserve("env-acct", 0.004)
     assert r.degraded is False
     r2 = s.reserve("env-acct", 0.001)
     assert r2.degraded is True
     s.reset()
+    s.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -185,6 +200,7 @@ def test_concurrent_reserves_serialize_on_one_account():
     assert balances == pytest.approx([0.0004, 0.0008, 0.0012, 0.0016])
     assert store.balance("race-acct") == pytest.approx(N * UNIT)
     store.reset("race-acct")
+    store.close()
 
 
 @needs_postgres
@@ -232,3 +248,110 @@ def test_row_lock_blocks_second_connection():
     assert tx2_result[0].balance == pytest.approx(0.0007)
     tx1.close()
     store.reset("lock-acct")
+    store.close()
+
+
+# --------------------------------------------------------------------------- #
+# REQUIRED: bounded pooling proof (the production connection-ceiling gap)
+# --------------------------------------------------------------------------- #
+
+
+@needs_postgres
+def test_bounded_pool_reuse_max_connections():
+    """Pool caps Postgres sockets at ``max_connections`` and reuses them.
+
+    ``max_connections=2``, two phases:
+
+    * Phase 1 — sequential reuse: 50 sequential reserves. The pool opens
+      exactly ONE connection and serves all 50 calls from it
+      (``connections_num == 1``); a fresh-``psycopg.connect()``-per-call
+      store would churn 50 connections. This proves reuse.
+    * Phase 2 — bounded ceiling under overload: a barrier-synchronized burst
+      of 6 threads x 5 reserves on ONE account, far exceeding pool capacity.
+      Demand beyond the ceiling must QUEUE on the pool, not open new
+      sockets: cumulative ``connections_num`` grows to exactly 2 and
+      ``pool_size`` never exceeds 2. A leaky or per-call store would exceed
+      it (or churn). This proves the connection ceiling.
+
+    Server-side ``pg_stat_activity`` count for this user, sampled between
+    calls, never exceeds ``max_connections`` (excludes the monitor
+    connection). All results must also be arithmetically correct — pooled
+    connection reuse must not contaminate transactions across calls.
+
+    Note: purely sequential traffic naturally uses exactly 1 connection
+    (next call reuses the one returned); the bound is proven by the
+    concurrent burst, where 6 threads must share the same 2 sockets.
+    """
+    N_SEQ = 50
+    BURST_THREADS = 6
+    BURST_EACH = 5
+    UNIT = 0.0005
+    store = PostgresAtomicStore(DSN, degraded_threshold=100.0, max_connections=2)
+    store.reset("bounded-acct")
+    server_conn_peak = 0
+    with psycopg.connect(DSN, connect_timeout=5) as monitor:
+        with monitor.cursor() as cur:
+            cur.execute("SELECT pg_backend_pid() AS pid")
+            monitor_pid = cur.fetchone()[0]  # raw connect: tuple rows
+        # Phase 1: sequential reuse.
+        for i in range(N_SEQ):
+            r = store.reserve("bounded-acct", UNIT)
+            assert r.balance == pytest.approx((i + 1) * UNIT)
+            with monitor.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM pg_stat_activity "
+                    "WHERE usename = current_user "
+                    "AND datname = current_database() "
+                    "AND pid <> %s",
+                    (monitor_pid,),
+                )
+                server_conn_peak = max(server_conn_peak, int(cur.fetchone()[0]))
+        # Phase 2: concurrent burst — demand (6 threads) exceeds capacity (2).
+        barrier = threading.Barrier(BURST_THREADS)
+        errors: list[BaseException] = []
+
+        def burst_worker(_: int) -> None:
+            try:
+                barrier.wait(timeout=30)
+                for _ in range(BURST_EACH):
+                    store.reserve("bounded-acct", UNIT)
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=burst_worker, args=(i,))
+            for i in range(BURST_THREADS)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        # Sample the server-side count once more while all conns are idle.
+        with monitor.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM pg_stat_activity "
+                "WHERE usename = current_user "
+                "AND datname = current_database() "
+                "AND pid <> %s",
+                (monitor_pid,),
+            )
+            server_conn_peak = max(server_conn_peak, int(cur.fetchone()[0]))
+        assert not errors, f"burst reserve raised: {errors}"
+    stats = store._pool.get_stats()
+    # Sequential phase alone uses exactly 1 connection; the burst grows the
+    # pool to the configured ceiling of 2 — never past it.
+    assert stats["connections_num"] == 2, (
+        f"pool opened {stats['connections_num']} connections cumulatively, "
+        f"expected exactly 2 (1 reused sequentially + 1 more under the burst, "
+        f"never more): {stats}"
+    )
+    assert stats["pool_size"] <= 2, (
+        f"pool_size={stats['pool_size']} exceeded max_connections=2"
+    )
+    assert server_conn_peak <= 2, (
+        f"server-side connection count peaked at {server_conn_peak} (>2)"
+    )
+    total = N_SEQ + BURST_THREADS * BURST_EACH
+    assert store.balance("bounded-acct") == pytest.approx(total * UNIT)
+    store.reset("bounded-acct")
+    store.close()

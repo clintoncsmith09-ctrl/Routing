@@ -15,6 +15,20 @@ therefore serialize — the second sees the first one's charge, exactly like
 SQLite's ``BEGIN IMMEDIATE`` write lock, but scoped to the account row instead
 of the whole database file.
 
+Connection pooling
+------------------
+Instead of opening a fresh ``psycopg.connect()`` per call, every store method
+acquires a connection from a bounded ``psycopg_pool.ConnectionPool`` for the
+duration of its transaction and returns it (context manager) — a ceiling on
+concurrent DB sockets regardless of traffic. The pool grows on demand
+(``min_size=0``) up to ``max_size = max_connections``, so a test-scale or
+low-traffic deployment opens only as many connections as are actually needed,
+while production traffic is capped at the configured bound. Connections are
+thread-safe to share across the orchestrator's worker threads (the pool serves
+concurrent ``connection()`` borrowers with distinct connections; per-account
+serialization still comes from the row locks, never from client-side
+locking).
+
 Schema mirrors ``DEPLOYMENT.md`` §1.2 (which mirrors ``_SCHEMA`` in
 ``orchestrator/store.py``) plus one extra ``account_locks`` table holding the
 per-account lock rows. The extra table is an internal locking detail; the
@@ -25,22 +39,25 @@ Wiring (per the runbook's ``STORE_*`` env knobs)::
 
     store = PostgresAtomicStore.from_env()  # DATABASE_URL, STORE_* ...
 
-Requires the optional ``postgres`` extra (``psycopg[binary]``); the base
-install stays temporalio-only.
+Requires the optional ``postgres`` extra (``psycopg[binary]`` +
+``psycopg-pool``); the base install stays temporalio-only.
 """
 
 from __future__ import annotations
 
 import os
 import time
-from typing import Optional
+from contextlib import contextmanager
+from typing import Iterator, Optional
 
 try:
     import psycopg
     from psycopg.rows import dict_row
+    from psycopg_pool import ConnectionPool
 except ImportError as _psycopg_import_error:  # pragma: no cover
     psycopg = None  # type: ignore[assignment]
     dict_row = None  # type: ignore[assignment]
+    ConnectionPool = None  # type: ignore[assignment]
     _PSYCOPG_IMPORT_ERROR = _psycopg_import_error
 else:
     _PSYCOPG_IMPORT_ERROR = None
@@ -77,9 +94,12 @@ CREATE TABLE IF NOT EXISTS account_locks (
 );
 """
 
+#: Default bound on the Postgres connection pool (``max_size``).
+DEFAULT_MAX_CONNECTIONS = 10
+
 
 def _require_psycopg() -> None:
-    if psycopg is None:
+    if psycopg is None or ConnectionPool is None:
         raise ImportError(
             "PostgresAtomicStore requires the optional 'postgres' extra "
             "(pip install routing-matrix[postgres]). "
@@ -94,6 +114,11 @@ class PostgresAtomicStore:
     account by ``SELECT ... FOR UPDATE`` on the account's lock row — genuine
     cross-thread/cross-process atomicity, not a Python ``threading.Lock``.
 
+    Connections come from a bounded ``psycopg_pool.ConnectionPool``
+    (``max_size = max_connections``): each method holds one pooled connection
+    for the duration of its transaction and returns it on exit, so concurrent
+    traffic can never exceed the configured number of DB sockets.
+
     Args:
         dsn: Postgres DSN, e.g.
             ``postgresql://user:pass@localhost:5432/routing_matrix``.
@@ -101,6 +126,8 @@ class PostgresAtomicStore:
             ``>=`` this value marks the account ``degraded`` (capped routing).
         usage_window_seconds: Rolling-window width; charges older than this
             are pruned when computing a balance.
+        max_connections: Upper bound on open Postgres connections in the
+            pool. The pool grows on demand up to this ceiling.
     """
 
     def __init__(
@@ -109,11 +136,31 @@ class PostgresAtomicStore:
         *,
         degraded_threshold: float = 0.0011,
         usage_window_seconds: float = 3600.0,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
     ) -> None:
         _require_psycopg()
         self._dsn = dsn
         self._threshold = float(degraded_threshold)
         self._window = float(usage_window_seconds)
+        self._max_connections = int(max_connections)
+        if self._max_connections < 1:
+            raise ValueError("max_connections must be >= 1")
+        if psycopg is None or ConnectionPool is None:  # pragma: no cover
+            raise AssertionError("unreachable after _require_psycopg")
+        # Bounded, lazily-growing pool. min_size=0: no connections are
+        # pre-created — the first transaction opens one, later concurrency
+        # grows it toward max_size, and idle ones are reused (putconn).
+        # kwargs are forwarded to psycopg.connect() per connection.
+        self._pool = ConnectionPool(
+            dsn,
+            min_size=0,
+            max_size=self._max_connections,
+            open=False,
+            kwargs={"row_factory": dict_row, "connect_timeout": 30},
+            name="routing-matrix-pg",
+            timeout=30.0,
+        )
+        self._pool.open()
         self._setup()
 
     # -- construction helpers ------------------------------------------------- #
@@ -122,9 +169,9 @@ class PostgresAtomicStore:
     def from_env(cls, dsn: Optional[str] = None, **overrides) -> "PostgresAtomicStore":
         """Build from the runbook's ``STORE_*`` env knobs (``DEPLOYMENT.md`` C5).
 
-        ``DATABASE_URL`` supplies the DSN; ``STORE_DEGRADED_THRESHOLD`` and
-        ``STORE_USAGE_WINDOW_SECONDS`` supply the tuning knobs. Explicit
-        arguments win over the environment.
+        ``DATABASE_URL`` supplies the DSN; ``STORE_DEGRADED_THRESHOLD``,
+        ``STORE_USAGE_WINDOW_SECONDS`` and ``STORE_PG_MAX_CONNECTIONS`` supply
+        the tuning knobs. Explicit arguments win over the environment.
         """
         resolved_dsn = dsn or os.environ.get("DATABASE_URL", "")
         if not resolved_dsn:
@@ -144,23 +191,44 @@ class PostgresAtomicStore:
                     os.environ.get("STORE_USAGE_WINDOW_SECONDS", 3600.0),
                 )
             ),
+            "max_connections": int(
+                overrides.get(
+                    "max_connections",
+                    os.environ.get("STORE_PG_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS),
+                )
+            ),
         }
         return cls(resolved_dsn, **kwargs)
 
-    def _connect(self):
-        assert psycopg is not None
-        conn = psycopg.connect(self._dsn, row_factory=dict_row, connect_timeout=30)
-        # autocommit=False (psycopg default): explicit commit()/rollback().
-        return conn
+    @contextmanager
+    def _connection(self) -> Iterator["psycopg.Connection"]:
+        """Acquire a pooled connection; commit/rollback + release on exit.
+
+        Wraps ``psycopg_pool.ConnectionPool.connection()``, whose context
+        manager returns the connection to the pool on exit and applies
+        psycopg's ``with conn`` behaviour (commit on success, rollback on
+        error). The explicit ``rollback()`` here runs before release, so a
+        failed transaction never re-enters the pool — a connection with an
+        aborted transaction would poison the next borrower ("current
+        transaction is aborted").
+        """
+        assert psycopg is not None and self._pool is not None  # pragma: no cover
+        with self._pool.connection() as conn:
+            try:
+                yield conn
+            except BaseException:
+                try:
+                    conn.rollback()
+                except Exception:  # pragma: no cover
+                    # Connection is broken; the pool discards it on putconn.
+                    pass
+                raise
 
     def _setup(self) -> None:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(_SCHEMA)
             conn.commit()
-        finally:
-            conn.close()
 
     def _lock_account(self, cur, account_id: str) -> None:
         """Serialize this account's read-modify-write on its lock row.
@@ -189,8 +257,7 @@ class PostgresAtomicStore:
         orchestrator passes into ``routing_matrix.route()``.
         """
         now = time.time()
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 self._lock_account(cur, account_id)
                 cur.execute(
@@ -217,11 +284,6 @@ class PostgresAtomicStore:
                 projected_cost=projected_cost,
                 balance=new_balance,
             )
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def settle(
         self, account_id: str, reserved_cost: float, actual_cost: float
@@ -232,8 +294,7 @@ class PostgresAtomicStore:
         with the actual cost and returns the resulting rolling balance.
         """
         now = time.time()
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 self._lock_account(cur, account_id)
                 cur.execute(
@@ -262,16 +323,10 @@ class PostgresAtomicStore:
                 balance = float(cur.fetchone()["balance"])
             conn.commit()
             return balance
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def balance(self, account_id: str) -> float:
         now = time.time()
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "DELETE FROM usage_charges WHERE account_id = %s AND ts < %s",
@@ -285,11 +340,6 @@ class PostgresAtomicStore:
                 balance = float(cur.fetchone()["balance"])
             conn.commit()
             return balance
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     # -- IdempotencyStore ----------------------------------------------------- #
 
@@ -302,8 +352,7 @@ class PostgresAtomicStore:
         ``(existing_task_id, False)`` when the key was already present — a
         duplicate submission must return the existing task, never a new one.
         """
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO idempotency(idempotency_key, task_id) "
@@ -324,15 +373,9 @@ class PostgresAtomicStore:
             # DO NOTHING fired, so the row must exist (concurrent claim won).
             assert existing is not None
             return existing["task_id"], False
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def get_idempotency(self, idempotency_key: str) -> Optional[str]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT task_id FROM idempotency WHERE idempotency_key = %s",
@@ -340,8 +383,6 @@ class PostgresAtomicStore:
                 )
                 row = cur.fetchone()
                 return row["task_id"] if row else None
-        finally:
-            conn.close()
 
     # -- TaskStore ------------------------------------------------------------ #
 
@@ -353,8 +394,7 @@ class PostgresAtomicStore:
         correlation_id: str,
     ) -> None:
         now = time.time()
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO tasks"
@@ -377,11 +417,6 @@ class PostgresAtomicStore:
                     ),
                 )
             conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def set_task_status(
         self,
@@ -394,8 +429,7 @@ class PostgresAtomicStore:
         estimated_cost: Optional[float] = None,
     ) -> None:
         now = time.time()
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE tasks SET status = %s, error = %s, tier = %s, "
@@ -413,17 +447,11 @@ class PostgresAtomicStore:
                     ),
                 )
             conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def get_task(self, task_id: str, account_id: str) -> Optional[dict]:
         """Tenant-scoped lookup. Returns ``None`` when the task does not belong
         to ``account_id`` — one account cannot reach another's task state."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT * FROM tasks WHERE task_id = %s", (task_id,)
@@ -437,37 +465,28 @@ class PostgresAtomicStore:
                     # account.
                     return None
                 return data
-        finally:
-            conn.close()
 
     def task_owner(self, task_id: str) -> Optional[str]:
         """Return the owning account id, or ``None`` if the task does not exist."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT account_id FROM tasks WHERE task_id = %s", (task_id,)
                 )
                 row = cur.fetchone()
                 return row["account_id"] if row else None
-        finally:
-            conn.close()
 
     def count_tasks(self) -> int:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) AS n FROM tasks")
                 return int(cur.fetchone()["n"])
-        finally:
-            conn.close()
 
     # -- test/admin helpers ---------------------------------------------------- #
 
     def reset(self, account_id: Optional[str] = None) -> None:
         """Clear usage/idempotency/tasks (optionally scoped to one account)."""
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 if account_id is None:
                     cur.execute("DELETE FROM usage_charges")
@@ -483,11 +502,19 @@ class PostgresAtomicStore:
                         "DELETE FROM tasks WHERE account_id = %s", (account_id,)
                     )
             conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def close(self) -> None:
-        """No-op (connections are short-lived); kept for parity."""
+        """Close the connection pool; subsequent calls raise ``PoolClosed``.
+
+        Idle connections are closed immediately; connections currently checked
+        out (a transaction in flight on another thread) are closed as they are
+        returned. ``close()`` is idempotent.
+        """
+        if self._pool is not None:
+            self._pool.close()
+
+    def __enter__(self) -> "PostgresAtomicStore":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()

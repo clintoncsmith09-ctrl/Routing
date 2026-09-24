@@ -91,13 +91,14 @@ real, locally-persisted atomic primitive: every read-modify-write runs in one
 The workflow and API never care which concrete store backs the interface —
 the swap seam is described at `orchestrator/store.py:34-45`.
 
-**Production:** swap in a Postgres- or Redis-backed implementation of the same
-three protocols and pass the object into `create_worker(...)` and
+**Production:** swap in the Postgres-backed implementation of the same
+three protocols — `PostgresAtomicStore` (`orchestrator/postgres_store.py`,
+ships with this repo) — and pass the object into `create_worker(...)` and
 `OrchestratorAPI(...)` (they take `store=...` / `store: SqliteAtomicStore` —
-`orchestrator/workflow.py:476-487`, `orchestrator/api.py:62-73`). The repo
-does **not** currently ship a Postgres/Redis implementation, so the operator's
-production glue must implement the protocols and construct the object from
-the env vars below.
+`orchestrator/workflow.py:476-487`, `orchestrator/api.py:62-73`). A Redis
+implementation of the protocols is not shipped; the operator's production
+glue must implement it from the key semantics below and construct the object
+from the env vars below.
 
 **Postgres — exact table requirements** (mirror `_SCHEMA`,
 `orchestrator/store.py:122-147`):
@@ -170,19 +171,21 @@ Lua script executed with `EVAL` (atomic by construction), or `INCRBYFLOAT` +
 `(account_id, degraded, projected_cost, balance)`. Exactly one reservation
 observes the previous one because EVAL runs the script atomically.
 
-**Store env vars the operator must provide** (the production launcher reads
-these; the repo code itself does not read them today):
+**Store env vars the operator must provide** (read by
+`PostgresAtomicStore.from_env()` — `orchestrator/postgres_store.py`; the
+SQLite store takes constructor args only):
 
 | Env var | Shape | Meaning |
 |---|---|---|
 | `DATABASE_URL` | Postgres DSN, e.g. `postgresql://user:pass@host:5432/routing_matrix` | Backing DB for the production store |
 | `REDIS_URL` | `redis://host:6379/0` (or `rediss://` for TLS) | Backing Redis if using the Redis implementation |
-| `STORE_DEGRADED_THRESHOLD` | float, default **`0.0011`** | A reservation whose resulting rolling balance is `>=` this marks the account degraded (capped routing) — constructor default `orchestrator/store.py:170` |
-| `STORE_USAGE_WINDOW_SECONDS` | float, default **`3600.0`** | Rolling-window width; charges older than this are pruned — constructor default `orchestrator/store.py:171` |
+| `STORE_DEGRADED_THRESHOLD` | float, default **`0.0011`** | A reservation whose resulting rolling balance is `>=` this marks the account degraded (capped routing) — constructor default `orchestrator/postgres_store.py` |
+| `STORE_USAGE_WINDOW_SECONDS` | float, default **`3600.0`** | Rolling-window width; charges older than this are pruned — constructor default `orchestrator/postgres_store.py` |
+| `STORE_PG_MAX_CONNECTIONS` | int, default **`10`** | Upper bound on open Postgres connections. `PostgresAtomicStore` acquires a connection from a bounded `psycopg_pool.ConnectionPool` for the duration of each transaction and returns it on exit (`min_size=0`, grows on demand up to this `max_size`) — constructor default `orchestrator/postgres_store.py` |
 
-(The last two are constructor params of `SqliteAtomicStore` today —
-`orchestrator/store.py:166-176` — so the production Postgres/Redis store must
-expose the same knobs and the launcher must map the env vars onto them.)
+(The last three are constructor params of `PostgresAtomicStore` —
+`orchestrator/postgres_store.py` — read from env by `from_env()`; the SQLite
+store takes constructor args only.)
 
 ### 1.3 Router env vars the Worker needs
 
@@ -336,7 +339,7 @@ Also note: `dispatch_task` has a `simulate_failure` test hook
 | C2 | Temporal address / namespace / TLS / auth env vars for Client + Worker processes | `orchestrator/workflow.py:472-493` (Worker); `orchestrator/api.py:126-143` (API) | `TEMPORAL_ADDRESS=<host:port>`, `TEMPORAL_NAMESPACE` (default `default`), `TEMPORAL_TLS=true` when applicable, `TEMPORAL_API_KEY` / mTLS vars (§1.1) |
 | C3 | Model pointer per tier | `resolve_model_pointer` reads env per tier; missing → `TierConfigError` and task failure (`routing_matrix/tiers.py:14-37`; resolved at `routing_matrix/core.py:78`; used by `route_task` activity `orchestrator/workflow.py:195-219`) | `TIER_1_MODEL_POINTER=<opaque>`, `TIER_2_MODEL_POINTER=<opaque>`, `TIER_3_MODEL_POINTER=<opaque>` — all three set in every Worker process |
 | C4 | Default provider | `RM_DEFAULT_PROVIDER` selects the dispatch provider; default `echo` is a placeholder (`routing_matrix/providers.py:74-87`); consumed at `orchestrator/workflow.py:267-268` | `RM_DEFAULT_PROVIDER=<registered provider name>` (default `echo`); register real adapters in code (`routing_matrix/providers.py:18-25,56-58`) |
-| C5 | Store backing + tuning | `SqliteAtomicStore` defaults `degraded_threshold=0.0011`, `usage_window_seconds=3600` (`orchestrator/store.py:166-176`); production store must expose the same knobs (§1.2) | `DATABASE_URL=<postgres DSN>` **or** `REDIS_URL=<redis URL>`; `STORE_DEGRADED_THRESHOLD` (default `0.0011`), `STORE_USAGE_WINDOW_SECONDS` (default `3600.0`) |
+| C5 | Store backing + tuning | `PostgresAtomicStore` defaults `degraded_threshold=0.0011`, `usage_window_seconds=3600`, `max_connections=10` (`orchestrator/postgres_store.py`; mirror of `SqliteAtomicStore` defaults at `orchestrator/store.py:166-176`); read from env by `from_env()` (§1.2) | `DATABASE_URL=<postgres DSN>` **or** `REDIS_URL=<redis URL>`; `STORE_DEGRADED_THRESHOLD` (default `0.0011`), `STORE_USAGE_WINDOW_SECONDS` (default `3600.0`), `STORE_PG_MAX_CONNECTIONS` (default `10`) |
 | C6 | (Single-worker MVP only) SQLite file path if you run `SqliteAtomicStore` | Constructor takes `db_path` (`orchestrator/store.py:166-172`); SQLite is fine for one worker only (§2.3) | e.g. `SQLITE_PATH=/var/lib/routing_matrix/store.db` (repo does not read a default — launcher must pass it) |
 | C7 | Global circuit breaker threshold | Trips the whole platform non-frontier when aggregate cost crosses it and stays tripped (`orchestrator/circuit_breaker.py:31-37,54-59`); consulted per task (`orchestrator/workflow.py:170-192`) | `CIRCUIT_BREAKER_RATE_THRESHOLD=<float>` (constructor arg; pick a platform spend budget) |
 | C8 | Rate limiter rate + burst | `TokenBucketLimiter(rate, capacity)` (`orchestrator/rate_limit.py:30-31`); enforced in API (`orchestrator/api.py:103-106`) and first workflow step (`orchestrator/workflow.py:130-136`) — note each submission consumes 2 tokens today (§2.1) | `RATE_LIMIT_RATE=<tokens/sec>`, `RATE_LIMIT_CAPACITY=<int>` |
